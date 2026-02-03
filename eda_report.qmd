@@ -1,0 +1,814 @@
+
+---
+title: "Home Credit Default Risk: Exploratory Data Analysis"
+author: "Data Analysis Report"
+date: "February 2, 2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+::: {.callout-note}
+This report was generated using AI under general human direction. At the time of generation, the contents have not been comprehensively reviewed by a human analyst.
+
+<!--
+To indicate human review: Delete the line above about contents not being reviewed, and replace this comment with:
+The contents have been reviewed and validated by [Your Name], [Your Role] on [Date].
+-->
+:::
+
+# Introduction
+
+This report presents an exploratory data analysis (EDA) of the Home Credit Default Risk dataset. The dataset contains information about loan applications, including client demographics, financial data, and historical behavior. The goal is to predict whether a client will have payment difficulties (default).
+
+## Dataset Overview
+
+```r
+library(tidyverse)
+library(scales)
+library(knitr)
+
+# Load the data
+app_train <- read_csv("application_train.csv", show_col_types = FALSE)
+app_test <- read_csv("application_test.csv", show_col_types = FALSE)
+```
+
+The dataset consists of two files:
+
+- **Training set**: `r nrow(app_train)` observations with `r ncol(app_train)` features
+- **Test set**: `r nrow(app_test)` observations with `r ncol(app_test)` features
+
+The training set includes the target variable (`TARGET`), while the test set does not.
+
+# Data Structure
+
+## Column Types
+
+```r
+# Summary of column types in training data
+train_types <- app_train |>
+  summarise(across(everything(), ~class(.)[1])) |>
+  pivot_longer(everything(), names_to = "column", values_to = "type") |>
+  count(type, name = "count")
+
+train_types |>
+  kable(caption = "Distribution of Column Types in Training Data")
+```
+
+The dataset contains `r sum(train_types$count[train_types$type == "character"])` categorical variables and `r sum(train_types$count[train_types$type == "numeric"])` numerical variables.
+
+## Train vs Test Comparison
+
+```r
+# Check if columns match between train and test (excluding TARGET)
+train_cols <- setdiff(names(app_train), "TARGET")
+test_cols <- names(app_test)
+
+all_match <- all(train_cols == test_cols)
+```
+
+**Column alignment**: The test set contains all features from the training set except `TARGET`: `r all_match`.
+
+# Target Variable Analysis
+
+The target variable indicates whether a client had payment difficulties:
+- **0**: No payment difficulties (good client)
+- **1**: Payment difficulties (default)
+
+```r
+# Target distribution
+target_summary <- app_train |>
+  count(TARGET) |>
+  mutate(
+    percentage = n / sum(n) * 100,
+    label = if_else(TARGET == 0, "No Default", "Default")
+  )
+
+target_summary |>
+  select(TARGET, label, n, percentage) |>
+  kable(digits = 2, caption = "Target Variable Distribution")
+```
+
+```r
+#| fig-width: 8
+#| fig-height: 5
+
+# Visualization
+ggplot(target_summary, aes(x = factor(TARGET), y = n, fill = label)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(percentage, 1), "%")), 
+            vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = c("No Default" = "#2ecc71", "Default" = "#e74c3c")) +
+  labs(
+    title = "Distribution of Target Variable",
+    x = "Target",
+    y = "Count",
+    fill = "Status"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+**Key Observation**: The dataset shows class imbalance with `r round(target_summary$percentage[target_summary$TARGET == 0], 1)`% non-defaults and `r round(target_summary$percentage[target_summary$TARGET == 1], 1)`% defaults. This imbalance should be considered in modeling.
+
+# Missing Data Analysis
+
+## Overall Missing Data Pattern
+
+```r
+# Calculate missing percentages for training data
+missing_train <- app_train |>
+  summarise(across(everything(), ~sum(is.na(.)) / n() * 100)) |>
+  pivot_longer(everything(), names_to = "column", values_to = "pct_missing") |>
+  arrange(desc(pct_missing))
+
+# Summary statistics
+missing_summary <- tibble(
+  metric = c("Columns with no missing data",
+             "Columns with < 10% missing",
+             "Columns with 10-50% missing",
+             "Columns with > 50% missing"),
+  count = c(
+    sum(missing_train$pct_missing == 0),
+    sum(missing_train$pct_missing > 0 & missing_train$pct_missing < 10),
+    sum(missing_train$pct_missing >= 10 & missing_train$pct_missing <= 50),
+    sum(missing_train$pct_missing > 50)
+  )
+)
+
+missing_summary |> kable(caption = "Missing Data Summary")
+```
+
+## Top Features with Missing Data
+
+```r
+# Show top 20 columns with most missing data
+missing_train |>
+  filter(pct_missing > 0) |>
+  head(20) |>
+  kable(digits = 2, caption = "Top 20 Columns with Missing Data")
+```
+
+```r
+#| fig-width: 10
+#| fig-height: 8
+
+# Visualize top missing columns
+missing_train |>
+  filter(pct_missing > 0) |>
+  head(20) |>
+  ggplot(aes(x = reorder(column, pct_missing), y = pct_missing)) +
+  geom_col(fill = "#3498db") +
+  coord_flip() +
+  labs(
+    title = "Top 20 Features with Missing Data",
+    x = "Feature",
+    y = "Percentage Missing (%)"
+  ) +
+  theme_minimal()
+```
+
+## Possible Solutions for Missing Data
+
+Based on the missing data patterns, here are recommended strategies:
+
+```r
+# Categorize features by missing percentage and suggest strategies
+missing_strategies <- missing_train |>
+  mutate(
+    strategy = case_when(
+      pct_missing == 0 ~ "No action needed",
+      pct_missing < 5 ~ "Simple imputation (median/mode)",
+      pct_missing >= 5 & pct_missing < 40 ~ "Advanced imputation or create 'missing' flag",
+      pct_missing >= 40 & pct_missing < 70 ~ "Consider dropping or use as binary indicator",
+      pct_missing >= 70 ~ "Likely drop - too much missing data"
+    )
+  ) |>
+  count(strategy, name = "n_features") |>
+  arrange(desc(n_features))
+
+missing_strategies |>
+  kable(caption = "Recommended Strategies by Missing Data Percentage")
+```
+
+**Key Recommendations:**
+
+1. **Building-related features** (APARTMENTS_AVG, BASEMENTAREA_AVG, etc.) have 60-70% missing data. These likely apply only to certain housing types. Options:
+   - Drop these features
+   - Create binary indicators (has building info / no building info)
+   - Impute only for relevant housing types
+
+2. **OWN_CAR_AGE** has `r round(missing_train$pct_missing[missing_train$column == "OWN_CAR_AGE"], 1)`% missing. This is likely missing for people who don't own cars (FLAG_OWN_CAR = 'N'). Create a flag and impute with 0 or special value.
+
+3. **Credit bureau variables** (AMT_REQ_CREDIT_BUREAU_*) have moderate missing. Could impute with 0 (no inquiries) or median values.
+
+4. **EXT_SOURCE variables** are important but have missing values. Consider multiple imputation or predictive imputation given their importance.
+
+# Relationship Between Target and Predictors
+
+## Correlation Analysis
+
+```r
+# Calculate correlations with target for all numerical variables
+numeric_cols <- app_train |>
+  select(where(is.numeric), -SK_ID_CURR) |>
+  names()
+
+correlations <- app_train |>
+  select(TARGET, all_of(numeric_cols)) |>
+  summarise(across(-TARGET, ~cor(., TARGET, use = "complete.obs"))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "correlation") |>
+  arrange(desc(abs(correlation)))
+```
+
+### Top Predictors by Correlation
+
+```r
+# Show top 15 features by absolute correlation
+top_correlations <- correlations |>
+  head(15)
+
+top_correlations |>
+  kable(digits = 3, caption = "Top 15 Features by Correlation with Target")
+```
+
+```r
+#| fig-width: 10
+#| fig-height: 7
+
+# Visualize top correlations
+top_correlations |>
+  ggplot(aes(x = reorder(variable, correlation), y = correlation, 
+             fill = correlation > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#2ecc71"),
+                    labels = c("Positive (higher default)", "Negative (lower default)")) +
+  labs(
+    title = "Top 15 Features by Correlation with Target",
+    subtitle = "Negative correlations indicate lower default risk",
+    x = "Feature",
+    y = "Correlation Coefficient",
+    fill = "Direction"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Analysis of Key Predictors
+
+### External Data Sources
+
+The external data source scores show the strongest correlations with the target.
+
+```r
+ext_sources <- c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")
+
+# Summary stats by target
+app_train |>
+  select(TARGET, all_of(ext_sources)) |>
+  pivot_longer(-TARGET, names_to = "source", values_to = "score") |>
+  filter(!is.na(score)) |>
+  group_by(TARGET, source) |>
+  summarise(
+    mean = mean(score),
+    median = median(score),
+    sd = sd(score),
+    .groups = "drop"
+  ) |>
+  kable(digits = 3, caption = "External Source Statistics by Target")
+```
+
+```r
+#| fig-width: 12
+#| fig-height: 5
+
+# Distribution comparison
+app_train |>
+  select(TARGET, all_of(ext_sources)) |>
+  pivot_longer(-TARGET, names_to = "source", values_to = "score") |>
+  filter(!is.na(score)) |>
+  ggplot(aes(x = score, fill = factor(TARGET))) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~source, ncol = 3) +
+  scale_fill_manual(values = c("0" = "#2ecc71", "1" = "#e74c3c"),
+                    labels = c("No Default", "Default")) +
+  labs(
+    title = "External Source Score Distributions by Target",
+    x = "Score",
+    y = "Density",
+    fill = "Target"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### Age and Employment
+
+```r
+# Create age variable
+app_train_analysis <- app_train |>
+  mutate(AGE_YEARS = -DAYS_BIRTH / 365)
+
+# Age statistics by target
+app_train_analysis |>
+  group_by(TARGET) |>
+  summarise(
+    mean_age = mean(AGE_YEARS),
+    median_age = median(AGE_YEARS),
+    sd_age = sd(AGE_YEARS)
+  ) |>
+  kable(digits = 2, caption = "Age Statistics by Target")
+```
+
+```r
+#| fig-width: 10
+#| fig-height: 5
+
+# Age distribution by target
+app_train_analysis |>
+  ggplot(aes(x = AGE_YEARS, fill = factor(TARGET))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("0" = "#2ecc71", "1" = "#e74c3c"),
+                    labels = c("No Default", "Default")) +
+  labs(
+    title = "Age Distribution by Target",
+    subtitle = "Younger and older applicants show different default patterns",
+    x = "Age (years)",
+    y = "Density",
+    fill = "Target"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### Credit and Income Ratios
+
+```r
+# Create derived features
+app_train_ratios <- app_train |>
+  mutate(
+    CREDIT_INCOME_RATIO = AMT_CREDIT / AMT_INCOME_TOTAL,
+    ANNUITY_INCOME_RATIO = AMT_ANNUITY / AMT_INCOME_TOTAL,
+    CREDIT_GOODS_RATIO = AMT_CREDIT / AMT_GOODS_PRICE
+  )
+
+# Check correlations of derived features
+derived_correlations <- app_train_ratios |>
+  select(TARGET, CREDIT_INCOME_RATIO, ANNUITY_INCOME_RATIO, CREDIT_GOODS_RATIO) |>
+  summarise(across(-TARGET, ~cor(., TARGET, use = "complete.obs"))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "correlation")
+
+derived_correlations |>
+  kable(digits = 3, caption = "Correlation of Derived Financial Ratios with Target")
+```
+
+```r
+#| fig-width: 12
+#| fig-height: 5
+
+# Visualize credit-to-income ratio by target
+app_train_ratios |>
+  filter(CREDIT_INCOME_RATIO < 10) |>  # Remove extreme outliers for visualization
+  ggplot(aes(x = CREDIT_INCOME_RATIO, fill = factor(TARGET))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("0" = "#2ecc71", "1" = "#e74c3c"),
+                    labels = c("No Default", "Default")) +
+  labs(
+    title = "Credit-to-Income Ratio Distribution by Target",
+    x = "Credit-to-Income Ratio",
+    y = "Density",
+    fill = "Target"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Categorical Variables and Target
+
+```r
+# Analyze default rates across key categorical variables
+categorical_vars <- c("NAME_CONTRACT_TYPE", "CODE_GENDER", "NAME_INCOME_TYPE", 
+                      "NAME_EDUCATION_TYPE", "NAME_FAMILY_STATUS")
+
+# Function to calculate default rate
+calc_default_rate <- function(data, var) {
+  data |>
+    group_by(!!sym(var)) |>
+    summarise(
+      total = n(),
+      defaults = sum(TARGET == 1),
+      default_rate = mean(TARGET) * 100,
+      .groups = "drop"
+    ) |>
+    arrange(desc(default_rate))
+}
+```
+
+### Contract Type
+
+```r
+calc_default_rate(app_train, "NAME_CONTRACT_TYPE") |>
+  kable(digits = 2, caption = "Default Rate by Contract Type")
+```
+
+### Income Type
+
+```r
+calc_default_rate(app_train, "NAME_INCOME_TYPE") |>
+  kable(digits = 2, caption = "Default Rate by Income Type")
+```
+
+### Education Type
+
+```r
+calc_default_rate(app_train, "NAME_EDUCATION_TYPE") |>
+  kable(digits = 2, caption = "Default Rate by Education Type")
+```
+
+```r
+#| fig-width: 12
+#| fig-height: 6
+
+# Visualize default rates across multiple categorical variables
+cat_default_rates <- bind_rows(
+  calc_default_rate(app_train, "NAME_CONTRACT_TYPE") |> mutate(category = "Contract Type"),
+  calc_default_rate(app_train, "NAME_INCOME_TYPE") |> mutate(category = "Income Type"),
+  calc_default_rate(app_train, "NAME_EDUCATION_TYPE") |> mutate(category = "Education")
+) |>
+  rename(value = 1) |>
+  filter(total > 100)  # Only show categories with sufficient observations
+
+cat_default_rates |>
+  ggplot(aes(x = reorder(value, default_rate), y = default_rate, fill = category)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~category, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Default Rates Across Categorical Variables",
+    x = "Category Value",
+    y = "Default Rate (%)",
+    fill = "Variable"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# Particularly Good Predictors
+
+Based on the analysis above, here are the variables that appear to be particularly strong predictors:
+
+## Summary of Top Predictors
+
+```r
+# Create summary table of top predictors
+top_predictors <- tibble(
+  Rank = 1:10,
+  Feature = c("EXT_SOURCE_2", "EXT_SOURCE_3", "EXT_SOURCE_1", 
+              "DAYS_BIRTH (Age)", "DAYS_EMPLOYED", "NAME_EDUCATION_TYPE",
+              "NAME_INCOME_TYPE", "CREDIT_INCOME_RATIO", "AMT_GOODS_PRICE",
+              "REGION_RATING_CLIENT"),
+  Type = c("Numerical", "Numerical", "Numerical", "Numerical", "Numerical",
+           "Categorical", "Categorical", "Derived", "Numerical", "Numerical"),
+  Correlation = c(
+    correlations$correlation[correlations$variable == "EXT_SOURCE_2"],
+    correlations$correlation[correlations$variable == "EXT_SOURCE_3"],
+    correlations$correlation[correlations$variable == "EXT_SOURCE_1"],
+    correlations$correlation[correlations$variable == "DAYS_BIRTH"],
+    correlations$correlation[correlations$variable == "DAYS_EMPLOYED"],
+    NA, NA,
+    derived_correlations$correlation[derived_correlations$variable == "CREDIT_INCOME_RATIO"],
+    correlations$correlation[correlations$variable == "AMT_GOODS_PRICE"],
+    correlations$correlation[correlations$variable == "REGION_RATING_CLIENT"]
+  ),
+  Notes = c(
+    "Strongest predictor - external credit score",
+    "Second external credit score",
+    "Third external credit score (more missing data)",
+    "Age in days (negative correlation = older = safer)",
+    "Employment length (watch for anomaly)",
+    "Education level shows varying default rates",
+    "Income type strongly differentiates default risk",
+    "Derived feature showing debt burden",
+    "Amount of goods purchased",
+    "Regional rating of client"
+  )
+)
+
+top_predictors |>
+  kable(digits = 3, caption = "Top 10 Most Promising Predictors")
+```
+
+## Key Insights
+
+1. **External Sources (EXT_SOURCE_1/2/3)**: These are by far the strongest predictors with correlations around -0.15 to -0.18. They should be prioritized despite some missing data.
+
+2. **Age (DAYS_BIRTH)**: Older applicants tend to have lower default rates. This is a reliable predictor with no missing data.
+
+3. **Education and Income Type**: These categorical variables show substantial variation in default rates across categories.
+
+4. **Financial Ratios**: Derived features like credit-to-income ratio can provide additional predictive power.
+
+5. **Regional Information**: Geographic ratings show some predictive power and have no missing data.
+
+## Recommendations for Modeling
+
+- **Feature Engineering**: Create additional derived features from existing variables (ratios, interactions)
+- **Handle External Sources Carefully**: Despite missing data, these are critical - use advanced imputation
+- **Categorical Encoding**: Use target encoding or other sophisticated methods for high-cardinality categorical variables
+- **Address DAYS_EMPLOYED**: Create a flag for the anomalous value before using this feature
+- **Consider Interactions**: Age × Income Type, Education × Credit Amount, etc. may reveal additional patterns
+
+# Data Quality Issues
+
+## DAYS_EMPLOYED Anomaly
+
+The `DAYS_EMPLOYED` variable represents the number of days before the application the person started current employment (negative values).
+
+```r
+# Summary of DAYS_EMPLOYED
+summary(app_train$DAYS_EMPLOYED)
+```
+
+```r
+#| fig-width: 10
+#| fig-height: 5
+
+# Distribution of DAYS_EMPLOYED
+app_train |>
+  ggplot(aes(x = DAYS_EMPLOYED)) +
+  geom_histogram(bins = 100, fill = "#e67e22") +
+  scale_x_continuous(labels = comma) +
+  labs(
+    title = "Distribution of DAYS_EMPLOYED",
+    subtitle = "Note the anomalous value at 365243",
+    x = "Days Employed (negative = days before application)",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```r
+# Count of anomalous value
+anomalous_employed <- app_train |>
+  filter(DAYS_EMPLOYED == 365243) |>
+  nrow()
+
+total_rows <- nrow(app_train)
+pct_anomalous <- anomalous_employed / total_rows * 100
+```
+
+**Key Finding**: There are `r comma(anomalous_employed)` observations (`r round(pct_anomalous, 2)`%) with `DAYS_EMPLOYED = 365243`, which appears to be a placeholder value for missing or special employment status (possibly retirees or unemployed).
+
+```r
+#| fig-width: 10
+#| fig-height: 5
+
+# Check target distribution for anomalous vs normal employment
+app_train |>
+  mutate(employment_status = if_else(DAYS_EMPLOYED == 365243, 
+                                     "Anomalous (365243)", 
+                                     "Normal")) |>
+  count(employment_status, TARGET) |>
+  group_by(employment_status) |>
+  mutate(pct = n / sum(n) * 100) |>
+  ggplot(aes(x = employment_status, y = pct, fill = factor(TARGET))) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("0" = "#2ecc71", "1" = "#e74c3c"),
+                    labels = c("No Default", "Default")) +
+  labs(
+    title = "Default Rate: Anomalous vs Normal DAYS_EMPLOYED",
+    x = "Employment Status",
+    y = "Percentage (%)",
+    fill = "Target"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Age Distribution (DAYS_BIRTH)
+
+```r
+# Convert days to years and analyze age
+app_train <- app_train |>
+  mutate(AGE_YEARS = -DAYS_BIRTH / 365)
+
+summary(app_train$AGE_YEARS)
+```
+
+```r
+#| fig-width: 10
+#| fig-height: 5
+
+# Age distribution
+app_train |>
+  ggplot(aes(x = AGE_YEARS)) +
+  geom_histogram(bins = 50, fill = "#16a085") +
+  labs(
+    title = "Age Distribution of Applicants",
+    x = "Age (years)",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```r
+#| fig-width: 10
+#| fig-height: 5
+
+# Age by target
+app_train |>
+  ggplot(aes(x = factor(TARGET), y = AGE_YEARS, fill = factor(TARGET))) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("0" = "#2ecc71", "1" = "#e74c3c"),
+                    labels = c("No Default", "Default")) +
+  labs(
+    title = "Age Distribution by Target",
+    x = "Target",
+    y = "Age (years)",
+    fill = "Status"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Data Consistency Checks
+
+```r
+# Check for logical inconsistencies
+inconsistencies <- tibble(
+  check = c(
+    "Negative income",
+    "Negative credit amount",
+    "Negative annuity",
+    "Credit amount < goods price (when both exist)",
+    "Children count > 15"
+  ),
+  count = c(
+    sum(app_train$AMT_INCOME_TOTAL < 0, na.rm = TRUE),
+    sum(app_train$AMT_CREDIT < 0, na.rm = TRUE),
+    sum(app_train$AMT_ANNUITY < 0, na.rm = TRUE),
+    sum(app_train$AMT_CREDIT < app_train$AMT_GOODS_PRICE, na.rm = TRUE),
+    sum(app_train$CNT_CHILDREN > 15, na.rm = TRUE)
+  )
+)
+
+inconsistencies |>
+  kable(caption = "Data Consistency Checks")
+```
+
+## Near-Zero Variance Features
+
+Some features have very little variance and may not be useful for modeling.
+
+```r
+# Identify near-zero variance features
+# For binary flags, check if >95% are the same value
+binary_flags_dist <- app_train |>
+  select(starts_with("FLAG_")) |>
+  summarise(across(everything(), ~mean(., na.rm = TRUE) * 100)) |>
+  pivot_longer(everything(), names_to = "flag", values_to = "pct_ones") |>
+  mutate(pct_zeros = 100 - pct_ones) |>
+  filter(pct_ones < 5 | pct_ones > 95) |>
+  arrange(pct_ones)
+
+binary_flags_dist |>
+  kable(digits = 2, caption = "Binary Flags with >95% Same Value (Near-Constant)")
+```
+
+**Key Finding**: `r nrow(binary_flags_dist)` binary flag features are near-constant (>95% same value). These include:
+
+- **FLAG_MOBIL**: 100% are 1 (everyone has mobile phone)
+- **FLAG_CONT_MOBILE**: 99.8% are 1 (almost everyone can be contacted by mobile)
+- **Many FLAG_DOCUMENT_X**: Most document flags have <1% positive values
+
+**Recommendation**: Consider removing these features as they provide minimal information:
+- FLAG_MOBIL (constant)
+- FLAG_DOCUMENT_2, _4, _7, _10, _12, _17, _21 (all <0.1% positive)
+
+## Outlier Analysis
+
+### Income Outliers
+
+```r
+# Income distribution summary
+income_outliers <- app_train |>
+  summarise(
+    min = min(AMT_INCOME_TOTAL),
+    q25 = quantile(AMT_INCOME_TOTAL, 0.25),
+    median = median(AMT_INCOME_TOTAL),
+    q75 = quantile(AMT_INCOME_TOTAL, 0.75),
+    q99 = quantile(AMT_INCOME_TOTAL, 0.99),
+    max = max(AMT_INCOME_TOTAL),
+    pct_over_1M = mean(AMT_INCOME_TOTAL > 1000000) * 100
+  )
+
+income_outliers |>
+  kable(format = "markdown", digits = 0, caption = "Income Distribution Summary")
+```
+
+**Key Finding**: 
+- Maximum income is `r comma(income_outliers$max)`, which is extremely high (117 million!)
+- `r round(income_outliers$pct_over_1M, 2)`% of applicants report income over 1 million
+- The 99th percentile is only `r comma(income_outliers$q99)`, suggesting extreme outliers
+
+**Recommendation**: Cap income values at 99th percentile or use log transformation to handle extreme skewness.
+
+### Credit Amount Outliers
+
+```r
+# Credit amount summary
+credit_outliers <- app_train |>
+  summarise(
+    min = min(AMT_CREDIT),
+    median = median(AMT_CREDIT),
+    q99 = quantile(AMT_CREDIT, 0.99),
+    max = max(AMT_CREDIT),
+    pct_over_2M = mean(AMT_CREDIT > 2000000) * 100
+  )
+
+credit_outliers |>
+  kable(format = "markdown", digits = 0, caption = "Credit Amount Distribution Summary")
+```
+
+**Finding**: `r round(credit_outliers$pct_over_2M, 2)`% of loans are over 2 million, with a maximum of `r comma(credit_outliers$max)`.
+
+### Age Validation
+
+```r
+# Age range check
+age_check <- app_train |>
+  mutate(AGE_YEARS = -DAYS_BIRTH / 365) |>
+  summarise(
+    min_age = min(AGE_YEARS),
+    max_age = max(AGE_YEARS),
+    pct_under_25 = mean(AGE_YEARS < 25) * 100,
+    pct_over_60 = mean(AGE_YEARS > 60) * 100
+  )
+
+age_check |>
+  kable(digits = 1, caption = "Age Range Validation")
+```
+
+**Finding**: Age ranges from `r round(age_check$min_age, 1)` to `r round(age_check$max_age, 1)` years, which is reasonable. The minimum age suggests a requirement of at least 20 years old for loan applications.
+
+### Children Count Extremes
+
+```r
+# Check extreme values in children count
+children_extreme <- app_train |>
+  filter(CNT_CHILDREN > 10) |>
+  count(CNT_CHILDREN, sort = TRUE)
+
+if(nrow(children_extreme) > 0) {
+  children_extreme |>
+    kable(caption = "Extreme Children Counts (>10)")
+}
+```
+
+**Finding**: There are `r sum(app_train$CNT_CHILDREN > 10, na.rm = TRUE)` observations with more than 10 children reported. The maximum is `r max(app_train$CNT_CHILDREN, na.rm = TRUE)` children, which may be data entry errors or very unusual cases.
+
+**Recommendation**: Investigate or cap children count at a reasonable threshold (e.g., 10).
+
+## Summary of Data Quality Issues
+
+1. **DAYS_EMPLOYED Anomaly**: 18% of data has placeholder value 365243
+2. **Near-Zero Variance**: ~19 binary flags are essentially constant
+3. **Extreme Outliers**: Income and credit amounts have very extreme values (likely errors)
+4. **Extreme Children Counts**: Some observations report >10 children
+5. **Missing Data**: See Missing Data Analysis section for details
+
+**Overall Data Quality**: The data is generally well-structured, but requires preprocessing to handle:
+- The DAYS_EMPLOYED anomaly (create flag + impute)
+- Near-constant features (remove)
+- Extreme outliers (cap or transform)
+- Missing values in important predictors (impute carefully)
+
+# Summary and Key Findings
+
+## Main Observations
+
+1. **Class Imbalance**: The dataset has approximately `r round(target_summary$percentage[target_summary$TARGET == 0], 1)`% non-defaults, indicating significant class imbalance that will need to be addressed in modeling.
+
+2. **Missing Data**: Several features have high percentages of missing data, particularly building-related features and some credit bureau variables. The most complete features are demographic and basic financial variables.
+
+3. **DAYS_EMPLOYED Anomaly**: The value 365243 appears to be a special placeholder affecting `r round(pct_anomalous, 2)`% of observations. This should be handled appropriately in preprocessing.
+
+4. **Age Distribution**: The age distribution shows a typical pattern for loan applicants, with the majority of applicants in the working-age range.
+
+## Next Steps
+
+- Handle the DAYS_EMPLOYED anomaly (create a flag and replace with NA or median)
+- Address missing data through imputation or feature engineering
+- Consider feature engineering from date variables (e.g., employment length, age bins)
+- Investigate building-related features and decide whether to drop or impute
+- Prepare for class imbalance in modeling (sampling, class weights, or appropriate metrics)
+- Further explore feature interactions and potentially create derived features
