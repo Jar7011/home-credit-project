@@ -1,0 +1,63 @@
+# Data files
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.json
+*.xml
+*.parquet
+*.feather
+*.arrow
+*.hdf5
+*.h5
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Model objects
+*.rds
+*.RData
+*.Rda
+*.rda
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Large intermediate files
+*.log
+*.tmp
+*.cache
+
+# R specific
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+*.egg-info/
+
+# Environment files
+.env
+.venv
+env/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
