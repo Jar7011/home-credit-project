@@ -1,0 +1,259 @@
+---
+title: "Home Credit Modeling"
+format: html
+---
+
+# Modeling Workflow
+
+Complete modeling pipeline for Home Credit default prediction.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readr)
+library(caret)
+library(randomForest)
+library(pROC)
+library(ROSE)
+
+calc_auc <- function(truth, estimate) {
+  auc_obj <- pROC::roc(as.numeric(truth), as.numeric(estimate), quiet = TRUE)
+  as.numeric(auc_obj$auc)
+}
+
+impute_numeric_median <- function(df) {
+  df %>% mutate(across(where(is.numeric), ~ if_else(is.na(.), median(., na.rm = TRUE), .)))
+}
+
+app_train_final <- read_csv("application_train_final.csv", show_col_types = FALSE)
+app_test_final <- read_csv("application_test_final.csv", show_col_types = FALSE)
+
+train <- app_train_final
+
+demo_cols <- c(
+  "DAYS_BIRTH", "DAYS_EMPLOYED", "DAYS_ID_PUBLISH", "DAYS_LAST_PHONE_CHANGE",
+  "AGE_YEARS", "EMPLOYMENT_YEARS", "CNT_FAM_MEMBERS"
+)
+demo_cols <- demo_cols[demo_cols %in% names(train)]
+
+cat("Data loaded. Train:", nrow(app_train_final), "rows. Test:", nrow(app_test_final), "rows.\n")
+```
+
+# 1. Baseline
+
+Establish a majority-class and simple EXT_SOURCE benchmark.
+
+```{r baseline, message=FALSE, warning=FALSE}
+majority_acc <- mean(train$TARGET == 0)
+cat("Majority class accuracy:", round(majority_acc, 4), "\n")
+
+ext_cols <- c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")
+ext_cols <- ext_cols[ext_cols %in% names(train)]
+
+if (length(ext_cols) > 0) {
+  train_simple <- train %>% select(TARGET, all_of(ext_cols)) %>% drop_na()
+  train_simple$score <- rowMeans(as.matrix(train_simple %>% select(all_of(ext_cols))), na.rm = TRUE)
+  baseline_auc <- calc_auc(train_simple$TARGET, train_simple$score)
+  cat("EXT_SOURCE baseline AUC:", round(baseline_auc, 4), "\n")
+}
+```
+
+# 2. Model Comparison
+
+Compare Logistic Regression, Naive Bayes, and Random Forest with 3-fold CV using AUC.
+
+```{r model_comparison, message=FALSE, warning=FALSE}
+library(naivebayes)
+
+numeric_cols <- train %>% select(where(is.numeric)) %>% select(-SK_ID_CURR, -TARGET) %>% names()
+model_data <- train %>% select(TARGET, all_of(numeric_cols)) %>% drop_na()
+
+set.seed(42)
+folds <- createFolds(model_data$TARGET, k = 3, list = TRUE)
+
+ext_source_cols <- c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")
+ext_source_cols <- ext_source_cols[ext_source_cols %in% names(model_data)]
+combined_cols <- unique(c(demo_cols, ext_source_cols))
+
+cv_results <- tibble(Model = character(), Fold = integer(), AUC = double())
+
+for (i in seq_along(folds)) {
+  idx <- folds[[i]]
+  tr <- model_data[-idx, ]
+  te <- model_data[idx, ]
+
+  fit_lr <- glm(reformulate(demo_cols, "TARGET"), data = tr, family = binomial)
+  pr_lr <- predict(fit_lr, newdata = te, type = "response")
+  cv_results <- cv_results %>% add_row(Model = "LR_Demo", Fold = i, AUC = calc_auc(te$TARGET, pr_lr))
+
+  tr_nb <- tr %>% mutate(TARGET = factor(TARGET, levels = c(0, 1)))
+  fit_nb <- naive_bayes(reformulate(combined_cols, "TARGET"), data = tr_nb)
+  pr_nb <- predict(fit_nb, newdata = te, type = "prob")[, "1"]
+  cv_results <- cv_results %>% add_row(Model = "NaiveBayes", Fold = i, AUC = calc_auc(te$TARGET, pr_nb))
+
+  tr_rf <- tr %>% mutate(TARGET = factor(TARGET, levels = c(0, 1)))
+  fit_rf <- randomForest(reformulate(combined_cols, "TARGET"), data = tr_rf, ntree = 100)
+  pr_rf <- predict(fit_rf, newdata = te, type = "prob")[, "1"]
+  cv_results <- cv_results %>% add_row(Model = "RandomForest", Fold = i, AUC = calc_auc(te$TARGET, pr_rf))
+}
+
+cv_results %>%
+  group_by(Model) %>%
+  summarise(Mean_AUC = mean(AUC), SD_AUC = sd(AUC), .groups = "drop") %>%
+  arrange(desc(Mean_AUC))
+```
+
+# 3. Class Imbalance
+
+Evaluate downsampling, upsampling, and SMOTE for LR on demographic features.
+
+```{r imbalance, message=FALSE, warning=FALSE}
+set.seed(42)
+down <- ovun.sample(TARGET ~ ., data = model_data, method = "under")$data
+up <- ovun.sample(TARGET ~ ., data = model_data, method = "over")$data
+smote <- ROSE::ROSE(TARGET ~ ., data = model_data, seed = 42)$data
+
+cv_lr_auc <- function(df) {
+  flds <- createFolds(df$TARGET, k = 3, list = TRUE)
+  aucs <- map_dbl(flds, function(idx) {
+    tr <- df[-idx, ]
+    te <- df[idx, ]
+    fit <- glm(reformulate(demo_cols, "TARGET"), data = tr, family = binomial)
+    pr <- predict(fit, newdata = te, type = "response")
+    calc_auc(te$TARGET, pr)
+  })
+  mean(aucs)
+}
+
+tibble(
+  Strategy = c("Original", "Downsample", "Upsample", "SMOTE"),
+  Mean_AUC = c(cv_lr_auc(model_data), cv_lr_auc(down), cv_lr_auc(up), cv_lr_auc(smote))
+)
+```
+
+# 4. Hyperparameter Tuning
+
+Use randomized search (~20 iterations) on a 5k subsample with 3-fold CV for Random Forest.
+
+```{r tuning, message=FALSE, warning=FALSE}
+set.seed(42)
+train_up <- up
+
+tune_df <- train_up %>%
+  select(TARGET, all_of(combined_cols)) %>%
+  impute_numeric_median() %>%
+  sample_n(min(5000, n()))
+
+flds <- createFolds(tune_df$TARGET, k = 3, list = TRUE)
+
+param_grid <- tibble(
+  mtry = sample(1:max(1, length(combined_cols)), 20, replace = TRUE),
+  ntree = sample(c(100, 150, 200, 300), 20, replace = TRUE),
+  nodesize = sample(c(1, 5, 10, 20), 20, replace = TRUE)
+)
+
+tuning_results <- tibble(iter = integer(), mtry = integer(), ntree = integer(), nodesize = integer(), Mean_AUC = double())
+
+for (j in seq_len(nrow(param_grid))) {
+  p <- param_grid[j, ]
+  aucs <- map_dbl(flds, function(idx) {
+    tr <- tune_df[-idx, ] %>% mutate(TARGET = factor(TARGET, levels = c(0, 1)))
+    te <- tune_df[idx, ]
+    fit <- randomForest(reformulate(combined_cols, "TARGET"), data = tr, mtry = p$mtry, ntree = p$ntree, nodesize = p$nodesize)
+    pr <- predict(fit, newdata = te, type = "prob")[, "1"]
+    calc_auc(te$TARGET, pr)
+  })
+
+  tuning_results <- tuning_results %>%
+    add_row(iter = j, mtry = p$mtry, ntree = p$ntree, nodesize = p$nodesize, Mean_AUC = mean(aucs, na.rm = TRUE))
+}
+
+best_params <- tuning_results %>% arrange(desc(Mean_AUC)) %>% slice(1)
+best_params
+```
+
+# 5. Supplementary Features
+
+Use aggregated supplementary features and compare with/without them.
+
+```{r supplementary_features, message=FALSE, warning=FALSE}
+supp_prefix <- c("BUREAU_", "PREV_APP_", "INSTALL_")
+supp_cols <- names(train)[str_detect(names(train), paste(supp_prefix, collapse = "|"))]
+supp_cols <- supp_cols[vapply(train[supp_cols], is.numeric, logical(1))]
+
+base_features <- demo_cols
+enriched_features <- unique(c(base_features, supp_cols))
+
+compare_rf_auc <- function(feature_set) {
+  df <- train %>%
+    select(TARGET, all_of(feature_set)) %>%
+    impute_numeric_median()
+
+  flds <- createFolds(df$TARGET, k = 3, list = TRUE)
+
+  aucs <- map_dbl(flds, function(idx) {
+    tr <- df[-idx, ] %>% mutate(TARGET = factor(TARGET, levels = c(0, 1)))
+    te <- df[idx, ]
+    fit <- randomForest(
+      reformulate(feature_set, "TARGET"),
+      data = tr,
+      ntree = best_params$ntree,
+      mtry = min(best_params$mtry, length(feature_set)),
+      nodesize = best_params$nodesize
+    )
+    pr <- predict(fit, newdata = te, type = "prob")[, "1"]
+    calc_auc(te$TARGET, pr)
+  })
+
+  mean(aucs)
+}
+
+auc_base <- compare_rf_auc(base_features)
+auc_enriched <- compare_rf_auc(enriched_features)
+
+supp_results <- tibble(
+  Model = c("RF (Demographics)", "RF (Demographics + Supplementary)"),
+  Mean_AUC = c(auc_base, auc_enriched)
+)
+
+supp_results
+
+final_features <- if (auc_enriched >= auc_base) enriched_features else base_features
+```
+
+# 6. Final Submission
+
+Predict default probabilities for each SK_ID_CURR in test and save `submission.csv`.
+
+```{r submission, message=FALSE, warning=FALSE}
+final_train <- train %>%
+  select(TARGET, all_of(final_features)) %>%
+  impute_numeric_median() %>%
+  mutate(TARGET = factor(TARGET, levels = c(0, 1)))
+
+rf_final <- randomForest(
+  reformulate(final_features, "TARGET"),
+  data = final_train,
+  ntree = best_params$ntree,
+  mtry = min(best_params$mtry, length(final_features)),
+  nodesize = best_params$nodesize
+)
+
+test_pred_df <- app_test_final %>%
+  select(SK_ID_CURR, all_of(final_features)) %>%
+  impute_numeric_median()
+
+probs <- predict(rf_final, newdata = test_pred_df, type = "prob")[, "1"]
+
+submission <- tibble(
+  SK_ID_CURR = test_pred_df$SK_ID_CURR,
+  TARGET = as.numeric(probs)
+)
+
+readr::write_csv(submission, "submission.csv")
+cat("Wrote submission.csv with", nrow(submission), "rows\n")
+```
+
+---
+End of modeling notebook.
+
+The random forest model got a score of 0.66 on the Kaggle competition.

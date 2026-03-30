@@ -55,6 +55,28 @@ Place these files in the project directory:
 
 **Also creates**: Cleaned, engineered, and aggregated intermediate files (9 total).
 
+## 📓 Modeling Notebook
+
+The `modeling.qmd` notebook documents model development from baseline to final Kaggle submission.
+
+### Models tried
+- Majority-class baseline and simple EXT_SOURCE benchmark
+- Logistic Regression (demographic and combined feature sets)
+- Naive Bayes
+- Random Forest
+- Class-imbalance variants (downsampling, upsampling, SMOTE)
+- Random Forest hyperparameter tuning (randomized search)
+
+### Performance summary
+- Baseline majority-class accuracy is high due to class imbalance, so AUC was used for model comparison.
+- Logistic Regression provided a strong, stable baseline.
+- Naive Bayes was tested as a lightweight probabilistic alternative.
+- Random Forest improved after tuning and adding supplementary engineered features.
+- Final Kaggle submission from the notebook reports a Random Forest score of **0.66**.
+
+### Final model selection
+Random Forest was selected as the final model because it handled nonlinear interactions in the engineered + supplementary feature set and gave the best practical competition performance among tested options.
+
 ## ✅ Key Features
 
 - ✓ Train/test consistency (no data leakage)
