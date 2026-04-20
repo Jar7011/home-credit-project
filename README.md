@@ -77,6 +77,24 @@ The `modeling.qmd` notebook documents model development from baseline to final K
 ### Final model selection
 Random Forest was selected as the final model because it handled nonlinear interactions in the engineered + supplementary feature set and gave the best practical competition performance among tested options.
 
+## Model Card Notebook
+
+The `model_card.qmd` notebook documents model governance, explainability, threshold policy, fairness checks, and practical deployment caveats for the final model.
+
+### What it covers
+- Model details (type, version, data summary, key hyperparameters)
+- Intended use and out-of-scope use
+- Performance metrics (cross-validated metrics + Kaggle AUC context)
+- Decision-threshold analysis with cost assumptions and sensitivity analysis
+- Explainability using SHAP on a 1,000-row sample
+- Adverse action mapping to human-readable denial reasons
+- Fairness analysis by `CODE_GENDER` and `NAME_EDUCATION_TYPE`
+- Limitations, risks, and operational controls
+- Executive summary for business stakeholders
+
+### Why it matters
+The model card is the primary governance document for non-technical and technical stakeholders before operational use.
+
 ## ✅ Key Features
 
 - ✓ Train/test consistency (no data leakage)

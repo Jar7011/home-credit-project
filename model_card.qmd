@@ -1,0 +1,657 @@
+---
+title: "Model Card"
+format: html
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+# 1. Model Details
+
+This section summarizes the final model selected in this project.
+
+## Model type
+
+- **Primary model:** Random Forest classifier
+- **Task:** Binary classification (`TARGET`: default = 1, non-default = 0)
+- **Prediction output:** Probability of default for each `SK_ID_CURR`
+
+## Version
+
+- **Model version:** `v1.0`
+- **Notebook:** `modeling.qmd`
+- **Submission artifact:** `submission.csv`
+
+## Training data summary
+
+- **Core source:** `application_train_final.csv`
+- **Training rows:** 307,511
+- **Target imbalance:** ~8% default rate (highly imbalanced)
+- **Feature sources used:**
+  - Application demographics and financial attributes
+  - Aggregated supplementary features from:
+    - `bureau.csv`
+    - `previous_application.csv`
+    - `installments_payments.csv`
+
+## Key hyperparameters
+
+Random Forest hyperparameters were tuned with randomized search (about 20 sampled configurations, 3-fold CV). The tuned parameters are:
+
+- `ntree` (number of trees)
+- `mtry` (features sampled per split)
+- `nodesize` (minimum terminal node size)
+
+The final run in `modeling.qmd` selects the best configuration from tuning and uses it for final training and submission generation.
+
+# 2. Intended Use
+
+This section clarifies who should use the model, what decisions it supports, and where it should not be used.
+
+## Who uses this model?
+
+- **Primary users:** Credit risk analysts, data scientists, and lending operations teams
+- **Secondary users:** Product and strategy stakeholders reviewing portfolio-level default risk
+- **Technical operators:** Teams responsible for generating scoring files (`submission.csv`) and monitoring model behavior
+
+## What decisions does it inform?
+
+- **Application-level risk screening:** Estimate probability of default for each applicant (`SK_ID_CURR`)
+- **Prioritization decisions:** Support review queues (e.g., manual review for higher-risk cases)
+- **Portfolio analysis:** Inform aggregate risk trends and scenario analysis across applicant segments
+- **Model benchmarking:** Provide a baseline risk-scoring reference in this project context
+
+## What is it not designed for?
+
+- **Not a standalone approval/denial engine:** It should support, not replace, lending policy and human oversight
+- **Not a causal model:** Predictions are associative and do not explain why default occurs
+- **Not guaranteed for other populations:** Performance may degrade outside the Home Credit data domain/time period
+- **Not for non-credit decisions:** It should not be used for employment, insurance, healthcare, or legal determinations
+- **Not fairness-certified:** Additional bias/fairness and compliance testing is required before production use
+
+
+# 3. Performance Metrics
+
+This section reports the key evaluation metrics used for this project. Because the target is imbalanced, AUC is the primary model selection metric.
+
+## Chosen threshold
+
+- **Decision threshold:** 0.50
+
+## Metrics summary
+
+- **Cross-validated AUC (3-fold):** Reported in `modeling.qmd` during model comparison and tuning.
+- **Kaggle AUC score:** **0.66**
+- **Precision @ 0.50:** Reported from validation predictions in the modeling workflow.
+- **Recall @ 0.50:** Reported from validation predictions in the modeling workflow.
+
+## Notes
+
+- Cross-validated AUC is used for model development and hyperparameter selection.
+- Kaggle score is treated as external benchmark performance.
+- Precision/recall are threshold-dependent and should be recalculated if threshold policy changes.
+
+# 4. Decision Threshold Analysis
+
+This section translates predicted default probabilities into lending decisions using an expected-value framework.
+
+## Economic assumptions (consumer lending)
+
+The following assumptions are used as a practical base case for unsecured consumer lending:
+
+1. **Typical consumer loan APR**
+   - Reference rate around **11.40%** for 24-month personal loans.
+   - Source: Federal Reserve G.19 and FRED series `TERMCBPER24NS`.
+
+2. **Loss given default (LGD)**
+   - Base-case **LGD = 75%** (implied recovery of 25%).
+   - Source: Basel Committee framework references for unsecured/retail-style benchmark assumptions.
+
+3. **Recovery rate**
+   - Base-case **25%**, with sensitivity range **15% to 35%**.
+
+4. **Profit on repaid loan (net)**
+   - Base-case **4% of principal** after funding/servicing/operational costs.
+   - Sensitivity range: **3% to 6%**.
+
+## Decision rule
+
+For a predicted default probability $p$, approve a loan if expected value is positive:
+
+$$
+EV(p) = (1-p)\cdot \Pi - p\cdot L
+$$
+
+where:
+
+- $\Pi$ = profit if repaid
+- $L$ = loss if defaulted = $EAD \cdot LGD$
+
+Break-even threshold:
+
+$$
+p^* = \frac{\Pi}{\Pi + L}
+$$
+
+Using base assumptions ($\Pi=0.04$, $LGD=0.75$, $EAD=1$):
+
+$$
+p^* = \frac{0.04}{0.04 + 0.75} \approx 0.0506
+$$
+
+Under this base case, predicted default probabilities above **~5.1%** should be classified as default risk.
+
+## Sensitivity analysis
+
+Using the same break-even equation:
+
+- **Conservative case** ($\Pi=0.03$, $LGD=0.85$): $p^* \approx 0.034$
+- **Base case** ($\Pi=0.04$, $LGD=0.75$): $p^* \approx 0.051$
+- **Optimistic case** ($\Pi=0.06$, $LGD=0.65$): $p^* \approx 0.085$
+
+This suggests a practical threshold policy range of roughly **3% to 9%**, depending on business assumptions.
+
+```{r threshold-sweep}
+library(dplyr)
+library(purrr)
+library(tibble)
+library(randomForest)
+
+# Build validation_scored if it is not already present in the session
+if (!exists("validation_scored")) {
+  if (!file.exists("rf_final.rds")) {
+    stop("Missing validation_scored and rf_final.rds. Please save the final model from modeling.qmd (rf_final.rds).")
+  }
+
+  rf_final <- readRDS("rf_final.rds")
+  train_df <- readr::read_csv("application_train_final.csv", show_col_types = FALSE)
+
+  impute_numeric_median_local <- function(df) {
+    df |>
+      dplyr::mutate(
+        dplyr::across(
+          where(is.numeric),
+          ~ dplyr::if_else(is.na(.), median(., na.rm = TRUE), .)
+        )
+      )
+  }
+
+  feature_cols <- attr(rf_final$terms, "term.labels")
+  feature_cols <- feature_cols[feature_cols %in% names(train_df)]
+
+  scored_df <- train_df |>
+    dplyr::select(TARGET, dplyr::all_of(feature_cols)) |>
+    impute_numeric_median_local()
+
+  set.seed(42)
+  idx <- sample(seq_len(nrow(scored_df)), size = floor(0.2 * nrow(scored_df)))
+
+  validation_scored <- scored_df[idx, , drop = FALSE]
+  x_val <- validation_scored |>
+    dplyr::select(-TARGET)
+  validation_scored <- validation_scored |>
+    dplyr::mutate(
+      score = predict(rf_final, newdata = x_val, type = "prob")[, "1"]
+    )
+}
+
+profit_repaid <- 0.04
+lgd <- 0.75
+ead <- 1
+loss_default <- ead * lgd
+
+threshold_grid <- seq(0.01, 0.30, by = 0.01)
+
+threshold_results <- map_dfr(threshold_grid, function(t) {
+  df <- validation_scored |>
+    mutate(
+      predict_default = as.integer(score >= t),
+      approve = 1 - predict_default,
+      tp = as.integer(predict_default == 1 & TARGET == 1),
+      fp = as.integer(predict_default == 1 & TARGET == 0),
+      fn = as.integer(predict_default == 0 & TARGET == 1),
+      expected_profit = if_else(TARGET == 0, profit_repaid, -loss_default) * approve
+    )
+
+  tibble(
+    threshold = t,
+    precision = sum(df$tp) / pmax(sum(df$tp) + sum(df$fp), 1),
+    recall = sum(df$tp) / pmax(sum(df$tp) + sum(df$fn), 1),
+    approval_rate = mean(df$approve),
+    expected_profit_per_app = mean(df$expected_profit)
+  )
+})
+
+optimal_threshold <- threshold_results |>
+  slice_max(expected_profit_per_app, n = 1)
+
+# Store scalar threshold for downstream sections
+chosen_threshold <- optimal_threshold$threshold[[1]]
+
+list(
+  threshold_results = threshold_results,
+  optimal_threshold = optimal_threshold,
+  chosen_threshold = chosen_threshold
+)
+```
+
+# 5. Explainability
+
+This section explains *why* the final model predicts higher or lower default risk by computing SHAP values on a 1,000-row sample for speed.
+
+To avoid retraining, this analysis **reuses the trained model artifact** produced by the modeling workflow.
+
+## Method
+
+- Load pre-trained final model from disk (`rf_final.rds`).
+- Load prepared training data (`application_train_final.csv`).
+- Use the model's predictor set directly from the fitted object.
+- Draw a 1,000-row random sample.
+- Compute approximate SHAP values with `fastshap`.
+
+```{r shap-summary}
+library(fastshap)
+library(ggplot2)
+library(forcats)
+
+# Local helper for numeric median imputation
+impute_numeric_median <- function(df) {
+  df |>
+    dplyr::mutate(
+      dplyr::across(
+        where(is.numeric),
+        ~ dplyr::if_else(is.na(.), median(., na.rm = TRUE), .)
+      )
+    )
+}
+
+# Reuse trained model from modeling notebook (do not retrain)
+if (!file.exists("rf_final.rds")) {
+  stop("Missing rf_final.rds. Please run modeling.qmd first so the trained final model is saved.")
+}
+
+rf_final <- readRDS("rf_final.rds")
+train_df <- readr::read_csv("application_train_final.csv", show_col_types = FALSE)
+
+# Infer predictor columns directly from the trained model
+feature_cols <- attr(rf_final$terms, "term.labels")
+feature_cols <- feature_cols[feature_cols %in% names(train_df)]
+
+# Build explainability frame and apply the same median imputation helper
+x_all <- train_df |>
+  dplyr::select(dplyr::all_of(feature_cols)) |>
+  impute_numeric_median()
+
+# 1,000-row sample for speed
+set.seed(42)
+idx <- sample(seq_len(nrow(x_all)), size = min(1000, nrow(x_all)))
+x_shap <- x_all[idx, , drop = FALSE]
+
+# Prediction wrapper: probability of class 1 (default)
+pred_wrapper <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "1"]
+}
+
+# Approximate SHAP values
+set.seed(42)
+shap_values <- fastshap::explain(
+  object = rf_final,
+  X = x_shap,
+  pred_wrapper = pred_wrapper,
+  nsim = 30,
+  adjust = TRUE
+)
+
+# Global importance: mean absolute SHAP
+shap_importance <- tibble::tibble(
+  Feature = colnames(shap_values),
+  MeanAbsSHAP = colMeans(abs(shap_values), na.rm = TRUE)
+) |>
+  dplyr::arrange(dplyr::desc(MeanAbsSHAP))
+
+# Report top predictive features
+top_features_shap <- shap_importance |>
+  dplyr::slice_head(n = 15)
+
+top_features_shap
+
+# SHAP summary bar plot
+ggplot(top_features_shap, aes(x = MeanAbsSHAP, y = fct_reorder(Feature, MeanAbsSHAP))) +
+  geom_col(fill = "#2C7FB8") +
+  labs(
+    title = "Top Features by Mean |SHAP| (1,000-row sample)",
+    x = "Mean absolute SHAP value",
+    y = "Feature"
+  ) +
+  theme_minimal()
+```
+
+## Interpretation
+
+- Features with larger mean absolute SHAP values contribute more strongly to model predictions.
+- This ranking is global (overall importance), not case-specific.
+- For individual-case explanations, the same SHAP matrix can be inspected row by row.
+
+## Sources
+
+- Federal Reserve Board, **G.19 Consumer Credit**.
+- FRED series **TERMCBPER24NS** (Finance Rate on Personal Loans at Commercial Banks, 24-Month Loan).
+- Basel Committee on Banking Supervision (BCBS), capital framework documentation for LGD benchmark context.
+
+# 6. Adverse Action Mapping
+
+This section translates technical model drivers into plain-language denial reasons suitable for adverse action communication.
+
+## Why this matters
+
+When an applicant is denied, adverse action notices should provide understandable reasons rather than raw feature names. The mappings below connect top predictive model features to human-readable explanations.
+
+## Feature-to-reason dictionary
+
+```{r adverse-action-dictionary}
+adverse_action_map <- tibble::tribble(
+  ~feature, ~reason_low, ~reason_high,
+  "EXT_SOURCE_1", "Limited external credit history.", "Recent external credit signals indicate elevated risk.",
+  "EXT_SOURCE_2", "Thin or limited external credit record.", "External credit behavior indicates higher repayment risk.",
+  "EXT_SOURCE_3", "Insufficient positive external credit evidence.", "External score pattern is consistent with higher default risk.",
+  "DAYS_BIRTH", "Limited age-related credit history depth.", "Age-related profile is associated with elevated portfolio risk.",
+  "DAYS_EMPLOYED", "Short employment history in current records.", "Employment history pattern is associated with elevated risk.",
+  "AMT_CREDIT", "Requested credit amount is high relative to similar approved borrowers.", "Credit request size is elevated relative to profile.",
+  "AMT_ANNUITY", "Estimated payment burden appears high.", "Payment burden relative to profile appears elevated.",
+  "AMT_INCOME_TOTAL", "Documented income appears limited for requested exposure.", "Income-to-obligation profile is less favorable.",
+  "BUREAU_DEBT_CREDIT_RATIO", "Existing debt burden appears high relative to available credit.", "Debt-to-credit pattern indicates elevated leverage.",
+  "PREV_APP_APPROVAL_RATE", "Prior application history shows limited approval success.", "Previous application outcomes suggest elevated risk.",
+  "INSTALL_LATE_PAYMENT_RATE", "Historical payment timeliness shows elevated lateness.", "Recent payment behavior indicates repayment irregularity."
+)
+
+adverse_action_map
+```
+
+## Generate applicant-level denial reasons
+
+The code below reuses SHAP outputs from Section 5 and creates up to 4 plain-language reasons per denied applicant.
+
+```{r adverse-action-reasons}
+# Inputs expected from previous sections:
+# - shap_values: SHAP matrix for sampled applicants
+# - x_shap: feature values for the same sampled applicants
+# - rf_final: trained model
+
+# Model scores for sampled applicants
+sample_scores <- pred_wrapper(rf_final, x_shap)
+
+# Use threshold from Section 4 if available; otherwise default to 0.50
+chosen_threshold <- if (exists("optimal_threshold")) {
+  optimal_threshold$threshold[[1]]
+} else {
+  0.50
+}
+
+# Build long SHAP frame
+shap_long <- as.data.frame(shap_values) |>
+  dplyr::mutate(row_id = dplyr::row_number()) |>
+  tidyr::pivot_longer(-row_id, names_to = "feature", values_to = "shap")
+
+# Add observed feature values for direction-aware messaging
+x_long <- x_shap |>
+  dplyr::mutate(row_id = dplyr::row_number()) |>
+  tidyr::pivot_longer(-row_id, names_to = "feature", values_to = "value")
+
+# Join and map reasons
+reason_candidates <- shap_long |>
+  dplyr::left_join(x_long, by = c("row_id", "feature")) |>
+  dplyr::left_join(adverse_action_map, by = c("feature")) |>
+  dplyr::mutate(
+    direction = dplyr::if_else(shap >= 0, "high", "low"),
+    denial_reason = dplyr::case_when(
+      direction == "high" & !is.na(reason_high) ~ reason_high,
+      direction == "low" & !is.na(reason_low) ~ reason_low,
+      TRUE ~ paste0("Feature pattern in ", feature, " increased predicted risk.")
+    )
+  )
+
+# Keep only contributors that increase default risk (positive SHAP)
+reason_top <- reason_candidates |>
+  dplyr::filter(shap > 0) |>
+  dplyr::group_by(row_id) |>
+  dplyr::slice_max(order_by = shap, n = 4, with_ties = FALSE) |>
+  dplyr::summarise(
+    reasons = paste(unique(denial_reason), collapse = " | "),
+    .groups = "drop"
+  )
+
+# Applicant-level explanation output for denied sample applicants
+adverse_action_output <- tibble::tibble(
+  row_id = seq_len(nrow(x_shap)),
+  score = sample_scores,
+  predicted_default = as.integer(sample_scores >= chosen_threshold)
+) |>
+  dplyr::left_join(reason_top, by = "row_id") |>
+  dplyr::filter(predicted_default == 1) |>
+  dplyr::mutate(
+    reasons = dplyr::coalesce(reasons, "Overall risk profile exceeded decision threshold.")
+  )
+
+# Display a few examples
+adverse_action_output |>
+  dplyr::slice_head(n = 10)
+```
+
+## Example plain-language reasons
+
+- "Limited external credit history."
+- "Historical payment timeliness shows elevated lateness."
+- "Existing debt burden appears high relative to available credit."
+- "Estimated payment burden appears high."
+
+## Compliance note
+
+These reason mappings are operational templates for communication and should be reviewed by legal/compliance teams before production use to ensure alignment with applicable adverse action notice requirements.
+
+# 7. Fairness Analysis
+
+This section evaluates group-level approval outcomes at the chosen decision threshold. We compare approval rates by `CODE_GENDER` and `NAME_EDUCATION_TYPE`, then summarize disparity indicators and implications.
+
+## Method
+
+- Reuse the trained final model (`rf_final.rds`) from the modeling workflow.
+- Score applicants in `application_train_final.csv`.
+- Classify predicted default using the chosen threshold from Section 4 (`chosen_threshold`; fallback `0.50`).
+- Define approval as `predicted_default == 0`.
+- Compare approval rates by group and compute disparity ratios relative to the highest-approval group within each attribute.
+
+```{r fairness-analysis}
+# Ensure model artifact exists
+if (!exists("rf_final")) {
+  if (file.exists("rf_final.rds")) {
+    rf_final <- readRDS("rf_final.rds")
+  } else {
+    stop("Missing rf_final.rds. Please save the final model from modeling.qmd first.")
+  }
+}
+
+fair_df <- readr::read_csv("application_train_final.csv", show_col_types = FALSE)
+
+# Use model feature set and apply same imputation helper from earlier sections
+feature_cols <- attr(rf_final$terms, "term.labels")
+feature_cols <- feature_cols[feature_cols %in% names(fair_df)]
+
+x_fair <- fair_df |>
+  dplyr::select(dplyr::all_of(feature_cols)) |>
+  impute_numeric_median()
+
+scores <- predict(rf_final, newdata = x_fair, type = "prob")[, "1"]
+
+threshold_fair <- if (exists("chosen_threshold")) chosen_threshold else 0.50
+
+scored_fair <- fair_df |>
+  dplyr::mutate(
+    score = scores,
+    predicted_default = as.integer(score >= threshold_fair),
+    approve = as.integer(predicted_default == 0)
+  )
+
+# --- Approval rates by CODE_GENDER ---
+approval_gender <- scored_fair |>
+  dplyr::filter(!is.na(CODE_GENDER)) |>
+  dplyr::group_by(CODE_GENDER) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    approval_rate = mean(approve),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(approval_rate)) |>
+  dplyr::mutate(
+    reference_rate = max(approval_rate, na.rm = TRUE),
+    disparity_ratio = approval_rate / reference_rate
+  )
+
+# --- Approval rates by NAME_EDUCATION_TYPE ---
+approval_education <- scored_fair |>
+  dplyr::filter(!is.na(NAME_EDUCATION_TYPE)) |>
+  dplyr::group_by(NAME_EDUCATION_TYPE) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    approval_rate = mean(approve),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(approval_rate)) |>
+  dplyr::mutate(
+    reference_rate = max(approval_rate, na.rm = TRUE),
+    disparity_ratio = approval_rate / reference_rate
+  )
+
+# Optional aggregate disparity summaries
+gender_gap <- max(approval_gender$approval_rate, na.rm = TRUE) - min(approval_gender$approval_rate, na.rm = TRUE)
+education_gap <- max(approval_education$approval_rate, na.rm = TRUE) - min(approval_education$approval_rate, na.rm = TRUE)
+
+gender_ratio_min <- min(approval_gender$disparity_ratio, na.rm = TRUE)
+education_ratio_min <- min(approval_education$disparity_ratio, na.rm = TRUE)
+
+fairness_summary <- tibble::tibble(
+  attribute = c("CODE_GENDER", "NAME_EDUCATION_TYPE"),
+  min_disparity_ratio = c(gender_ratio_min, education_ratio_min),
+  approval_rate_gap = c(gender_gap, education_gap)
+)
+
+list(
+  threshold_used = threshold_fair,
+  approval_by_gender = approval_gender,
+  approval_by_education = approval_education,
+  disparity_summary = fairness_summary
+)
+```
+
+## Interpretation and implications
+
+- **Disparity ratio** close to 1.00 indicates similar approval rates across groups.
+- Lower ratios indicate that some groups receive approvals at materially lower rates than the highest-approval group.
+- If gaps are large, policy review should include:
+  - threshold calibration checks,
+  - feature sensitivity analysis,
+  - segmentation diagnostics,
+  - and legal/compliance review before deployment.
+
+This is a screening fairness check only. It does not replace formal fairness, legal, or regulatory validation.
+
+# 8. Limitations and Risks
+
+This model supports default-risk screening, but it has important limitations and should not be used as a fully autonomous decision system.
+
+## Known limitations
+
+- **Class imbalance sensitivity:** Default cases are relatively rare, so threshold choice and resampling strategy can materially change behavior.
+- **Overfitting risk:** Tree-based models can overfit high-dimensional engineered and aggregated features.
+- **Calibration uncertainty:** Predicted probabilities may not be perfectly calibrated to observed default rates without post-calibration.
+- **Data dependency:** Performance is tied to the Home Credit schema and period; transfer to other lenders/regions/timeframes may degrade performance.
+- **Drift exposure:** Economic conditions and applicant behavior can shift over time, reducing model quality if not monitored and retrained.
+
+## Where the model might fail
+
+- **Out-of-distribution applicants:** New products, segments, or macroeconomic regimes not represented in training data.
+- **Sparse-credit applicants:** Limited credit history increases prediction uncertainty.
+- **Small subpopulations:** Underrepresented groups may have less stable estimates.
+- **Policy/process changes:** Changes in underwriting policy or data collection can invalidate learned patterns.
+
+## Missing or incomplete data
+
+- **No direct affordability/cash-flow view:** Limited visibility into real-time expenses and debt-service capacity.
+- **Limited recent behavioral context:** Aggregated historical features may miss abrupt financial shocks.
+- **No explicit macro variables:** Inflation, unemployment, and regional stress indicators are not directly modeled.
+- **Predictive, not causal:** Model estimates association with default risk, not cause.
+- **Fairness context is incomplete:** Group-rate checks do not by themselves prove legal or ethical adequacy.
+
+## Practical risk controls
+
+- Use model output as **decision support**, not sole decision authority.
+- Keep **human review** for borderline/high-impact decisions.
+- Monitor **AUC, calibration, approval rates, and subgroup disparities** over time.
+- Reassess thresholds when business assumptions (profit/loss/recovery) change.
+- Retrain periodically and validate on newer data before updates.
+
+# 9. Executive Summary
+
+This one-page summary is intended for senior business stakeholders who need a decision-ready view of model outcomes and tradeoffs.
+
+## Business recommendation
+
+Deploy the current credit risk model as a **decision-support screening layer** in underwriting, with:
+
+- the selected operating threshold from Section 4 (decision threshold analysis),
+- human review for borderline/high-impact applications,
+- and ongoing monitoring for drift and fairness.
+
+Recommended operating approach:
+
+1. Use model probability to triage applications into low-risk, medium-risk, and high-risk bands.
+2. Auto-clear only clearly low-risk cases.
+3. Route medium/high-risk and policy exceptions to manual adjudication.
+
+This balances risk reduction with approval volume and keeps final accountability in policy/governance processes.
+
+## Expected financial impact at the chosen threshold
+
+Using the threshold selected in Section 4, expected value is defined as:
+
+$$
+EV(p) = (1-p)\cdot \Pi - p\cdot L
+$$
+
+where $\Pi$ is net profit on a repaid loan and $L$ is loss on default.
+
+At the chosen threshold, business impact should be interpreted through three KPIs:
+
+- **Expected profit per application** (primary objective),
+- **Approval rate** (volume/capture),
+- **Recall on defaults** (risk capture).
+
+Based on this project’s threshold analysis and Kaggle-calibrated performance context:
+
+- the chosen threshold improves expected portfolio economics versus a naive approval policy,
+- reduces avoidable default exposure by flagging high-risk borrowers,
+- and preserves meaningful approval throughput.
+
+Operationally, finance/risk should convert this to dollars using current portfolio assumptions:
+
+- average loan amount,
+- observed loss-given-default/recovery,
+- and current contribution margin on repaid loans.
+
+## Key caveats for leadership
+
+1. **Model is not a standalone approval engine.** It is a risk signal to inform—not replace—credit policy and human oversight.
+2. **Threshold is business-assumption dependent.** Changes in margin, LGD, or recovery require threshold recalibration.
+3. **Performance can drift over time.** Macroeconomic and borrower behavior shifts can degrade model quality without monitoring/retraining.
+4. **Fairness and compliance checks are mandatory.** Group-level approval disparities must be reviewed before operational deployment.
+5. **Kaggle score is not production validation.** External leaderboard performance is useful but does not substitute for internal governance, calibration, and backtesting.
+
+## Executive decision
+
+Proceed with controlled deployment as a decision-support model, with formal governance guardrails:
+
+- monthly monitoring dashboard (AUC, calibration, approvals, default capture, disparities),
+- documented threshold review triggers,
+- and periodic retraining using recent data.
+
+This yields practical business value while managing regulatory and model risk.

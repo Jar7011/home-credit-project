@@ -249,6 +249,7 @@ submission <- tibble(
   TARGET = as.numeric(probs)
 )
 
+saveRDS(rf_final, "rf_final.rds")
 readr::write_csv(submission, "submission.csv")
 cat("Wrote submission.csv with", nrow(submission), "rows\n")
 ```
